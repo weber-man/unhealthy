@@ -41,7 +41,7 @@ type monitor struct {
 	docker   *dockerClient
 	http     *http.Client
 	cfg      config
-	notified map[string]struct{}
+	notified map[string]containerDetails
 }
 
 type containerDetails struct {
@@ -55,8 +55,9 @@ type containerDetails struct {
 }
 
 type dockerClient struct {
-	baseURL    string
-	httpClient *http.Client
+	baseURL     string
+	displayHost string
+	httpClient  *http.Client
 }
 
 type dockerContainerSummary struct {
@@ -93,8 +94,16 @@ func main() {
 		docker:   dockerClient,
 		http:     &http.Client{Timeout: cfg.httpTimeout},
 		cfg:      cfg,
-		notified: make(map[string]struct{}),
+		notified: make(map[string]containerDetails),
 	}
+
+	log.Printf("starting unhealthy monitor: poll_interval=%s request_method=%s request_timeout=%s docker_host=%s headers=%s",
+		cfg.pollInterval,
+		cfg.requestMethod,
+		cfg.httpTimeout,
+		dockerClient.displayHost,
+		strings.Join(sortedHeaderKeys(cfg.headers), ","),
+	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -175,6 +184,7 @@ func normalizeTemplate(value string) string {
 }
 
 func (m *monitor) run(ctx context.Context) error {
+	log.Printf("running initial health check")
 	if err := m.check(ctx); err != nil {
 		log.Printf("initial check failed: %v", err)
 	}
@@ -185,8 +195,10 @@ func (m *monitor) run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			log.Printf("shutdown signal received, stopping monitor")
 			return ctx.Err()
 		case <-ticker.C:
+			log.Printf("running scheduled health check")
 			if err := m.check(ctx); err != nil {
 				log.Printf("scheduled check failed: %v", err)
 			}
@@ -201,6 +213,9 @@ func (m *monitor) check(ctx context.Context) error {
 	}
 
 	unhealthyIDs := make(map[string]struct{}, len(containers))
+	newlyNotified := 0
+	alreadyTracked := 0
+	recovered := 0
 	for _, summary := range containers {
 		details, err := m.docker.inspectContainer(ctx, summary.ID)
 		if err != nil {
@@ -213,6 +228,7 @@ func (m *monitor) check(ctx context.Context) error {
 		unhealthyIDs[summary.ID] = struct{}{}
 
 		if _, alreadyNotified := m.notified[summary.ID]; alreadyNotified {
+			alreadyTracked++
 			continue
 		}
 
@@ -220,15 +236,26 @@ func (m *monitor) check(ctx context.Context) error {
 			return err
 		}
 
-		m.notified[summary.ID] = struct{}{}
-		log.Printf("sent notification for container %s", details.Name)
+		m.notified[summary.ID] = details
+		newlyNotified++
+		log.Printf("notification delivered for container %s (%s)", details.Name, details.ID)
 	}
 
-	for id := range m.notified {
+	for id, details := range m.notified {
 		if _, unhealthy := unhealthyIDs[id]; !unhealthy {
+			log.Printf("container recovered: %s (%s)", details.Name, id)
 			delete(m.notified, id)
+			recovered++
 		}
 	}
+
+	log.Printf("health check complete: unhealthy=%d newly_notified=%d already_tracked=%d recovered=%d active_notifications=%d",
+		len(unhealthyIDs),
+		newlyNotified,
+		alreadyTracked,
+		recovered,
+		len(m.notified),
+	)
 
 	return nil
 }
@@ -256,18 +283,21 @@ func newDockerClient() (*dockerClient, error) {
 			},
 		}
 		return &dockerClient{
-			baseURL:    "http://docker",
-			httpClient: &http.Client{Transport: transport},
+			baseURL:     "http://docker",
+			displayHost: rawHost,
+			httpClient:  &http.Client{Transport: transport},
 		}, nil
 	case "tcp":
 		return &dockerClient{
-			baseURL:    "http://" + parsed.Host,
-			httpClient: &http.Client{},
+			baseURL:     "http://" + parsed.Host,
+			displayHost: rawHost,
+			httpClient:  &http.Client{},
 		}, nil
 	case "http", "https":
 		return &dockerClient{
-			baseURL:    parsed.String(),
-			httpClient: &http.Client{},
+			baseURL:     parsed.String(),
+			displayHost: rawHost,
+			httpClient:  &http.Client{},
 		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported DOCKER_HOST scheme %q", parsed.Scheme)
@@ -306,6 +336,13 @@ func (m *monitor) notify(ctx context.Context, details containerDetails) error {
 		return fmt.Errorf("render request body: %w", err)
 	}
 
+	log.Printf("sending %s notification for container %s (%s) to %s",
+		m.cfg.requestMethod,
+		details.Name,
+		details.ID,
+		sanitizeURLForLog(requestURL),
+	)
+
 	req, err := http.NewRequestWithContext(ctx, m.cfg.requestMethod, requestURL, strings.NewReader(requestBody))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
@@ -331,6 +368,28 @@ func (m *monitor) notify(ctx context.Context, details containerDetails) error {
 	}
 
 	return nil
+}
+
+func sortedHeaderKeys(headers map[string]string) []string {
+	keys := make([]string, 0, len(headers))
+	for key := range headers {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sanitizeURLForLog(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return "configured target"
+	}
+
+	if parsed.Scheme == "" {
+		return parsed.Host
+	}
+
+	return parsed.Scheme + "://" + parsed.Host
 }
 
 func renderTemplate(tmpl *template.Template, data map[string]any) (string, error) {
