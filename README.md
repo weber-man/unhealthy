@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="unhealthy logo" width="220">
+</p>
+
 # unhealthy
 
 `unhealthy` is a small Go-based Docker monitor that watches for containers whose health status becomes `unhealthy` and sends a configurable HTTP request when that happens.
