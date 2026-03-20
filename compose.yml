@@ -1,0 +1,15 @@
+services:
+  unhealthy-monitor:
+    image: ghcr.io/weber-man/unhealthy:latest
+    restart: unless-stopped
+    environment:
+      POLL_INTERVAL: 30s
+      REQUEST_URL: https://example.invalid/webhook
+      REQUEST_METHOD: POST
+      REQUEST_TIMEOUT: 10s
+      REQUEST_BODY_TEMPLATE: >-
+        { "message": "The container {{ container.name }} has the status {{ container.status }}",
+          "recipient": "recipient"
+        }
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
