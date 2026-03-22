@@ -4,14 +4,15 @@
 
 # unhealthy
 
-`unhealthy` is a small Go-based Docker monitor that watches for containers whose health status becomes `unhealthy` and sends a configurable HTTP request when that happens.
+`unhealthy` is a small Go-based Docker monitor that watches for containers whose health status becomes `unhealthy` and sends a configurable HTTP request when that happens. It can also optionally notify when a container changes from Docker state `running` to any other state.
 
 ## How it works
 
 1. The process connects to the local Docker daemon.
-2. It polls for containers with an `unhealthy` health check state.
+2. It polls Docker for container state and health information.
 3. For each newly unhealthy container, it renders the configured URL and request body templates.
-4. It sends the HTTP request once per unhealthy period and waits until the container recovers before sending another notification for the same container.
+4. If enabled, it also sends a notification when an observed container changes from state `running` to a different Docker state.
+5. Unhealthy notifications are sent once per unhealthy period and are reset after recovery. Running-state change notifications are sent once per observed transition.
 
 The published container image is built as a minimal `scratch` image and only contains the statically linked Go binary plus CA certificates for outbound HTTPS requests.
 
@@ -28,6 +29,7 @@ All configuration is provided through environment variables.
 | `POLL_INTERVAL` | No | `30s` | How often Docker should be checked for unhealthy containers. |
 | `REQUEST_HEADERS_JSON` | No | `{"Content-Type":"application/json"}` | JSON object of headers to attach to the request. |
 | `REQUEST_CONTENT_TYPE` | No | `application/json` | Convenience override for the `Content-Type` header. |
+| `NOTIFY_ON_RUNNING_STATE_CHANGE` | No | `false` | When `true`, also send a notification if a container changes from Docker state `running` to any other state between polls. |
 | `DOCKER_HOST` | No | Docker default | Optional Docker endpoint override supported by the Docker client. |
 
 ## Template variables
@@ -45,6 +47,9 @@ Available variables:
 | `{{ container.state }}` | Docker container state |
 | `{{ container.health }}` | Docker health status |
 | `{{ container.started_at }}` | Container start timestamp from Docker |
+| `{{ event.type }}` | Notification type: `unhealthy` or `running_state_change` |
+| `{{ event.previous_state }}` | Previous Docker state for running-state change notifications |
+| `{{ event.current_state }}` | Current Docker state for running-state change notifications |
 | `{{ time.rfc3339 }}` | Current UTC timestamp in RFC3339 format |
 | `{{ time.unix }}` | Current UTC Unix timestamp |
 
@@ -52,6 +57,14 @@ Example body template:
 
 ```json
 { "message": "The container {{ container.name }} has the status {{ container.status }}", "number": "+1234567", "recipients": ["YOURSELF"] }
+```
+
+Example body template that distinguishes both notification types:
+
+```json
+{
+  "message": "{{ event.type }} for {{ container.name }}: {{ event.previous_state }} -> {{ event.current_state }} (status: {{ container.status }})"
+}
 ```
 
 ## Example compose file
@@ -66,13 +79,16 @@ services:
     restart: unless-stopped
     environment:
       POLL_INTERVAL: 30s
+      NOTIFY_ON_RUNNING_STATE_CHANGE: "true"
       REQUEST_URL: https://example.invalid/webhook
       REQUEST_METHOD: POST
       REQUEST_TIMEOUT: 10s
       REQUEST_BODY_TEMPLATE: >-
-        { "message": "The container {{ container.name }} has the status {{ container.status }}",
-        "number": "+123456789",
-        "recipients": ["yourself"] }
+        {
+          "message": "{{ event.type }} for {{ container.name }}: {{ container.status }}",
+          "number": "+123456789",
+          "recipients": ["yourself"]
+        }
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
 ```
@@ -84,7 +100,7 @@ The Docker socket mount is required so the monitor can inspect local containers.
 ```bash
 go test ./...
 REQUEST_URL=https://example.invalid/webhook \
-REQUEST_BODY_TEMPLATE='{"message":"The container {{ container.name }} has the status {{ container.status }}"}' \
+REQUEST_BODY_TEMPLATE='{"message":"{{ event.type }} for {{ container.name }}: {{ container.status }}"}' \
 go run .
 ```
 
@@ -120,7 +136,8 @@ Run locally:
 ```bash
 docker run --rm \
   -e REQUEST_URL=https://example.invalid/webhook \
-  -e REQUEST_BODY_TEMPLATE='{"message":"The container {{ container.name }} has the status {{ container.status }}"}' \
+  -e NOTIFY_ON_RUNNING_STATE_CHANGE=true \
+  -e REQUEST_BODY_TEMPLATE='{"message":"{{ event.type }} for {{ container.name }}: {{ container.status }}"}' \
   -v /var/run/docker.sock:/var/run/docker.sock:ro \
   ghcr.io/weber-man/unhealthy:latest
 ```

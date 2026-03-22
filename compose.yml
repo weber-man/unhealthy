@@ -4,11 +4,13 @@ services:
     restart: unless-stopped
     environment:
       POLL_INTERVAL: 30s
+      NOTIFY_ON_RUNNING_STATE_CHANGE: "true"
       REQUEST_URL: https://example.invalid/webhook
       REQUEST_METHOD: POST
       REQUEST_TIMEOUT: 10s
       REQUEST_BODY_TEMPLATE: >-
-        { "message": "The container {{ container.name }} has the status {{ container.status }}",
+        {
+          "message": "{{ event.type }} for {{ container.name }}: {{ container.status }}",
           "recipient": "recipient"
         }
     volumes:

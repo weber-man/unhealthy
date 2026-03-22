@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/template"
@@ -29,12 +30,13 @@ const (
 var simpleTemplatePattern = regexp.MustCompile(`\{\{\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*\}\}`)
 
 type config struct {
-	pollInterval  time.Duration
-	requestMethod string
-	requestURL    *template.Template
-	requestBody   *template.Template
-	headers       map[string]string
-	httpTimeout   time.Duration
+	pollInterval               time.Duration
+	requestMethod              string
+	requestURL                 *template.Template
+	requestBody                *template.Template
+	headers                    map[string]string
+	httpTimeout                time.Duration
+	notifyOnRunningStateChange bool
 }
 
 type monitor struct {
@@ -42,6 +44,7 @@ type monitor struct {
 	http     *http.Client
 	cfg      config
 	notified map[string]containerDetails
+	lastSeen map[string]containerDetails
 }
 
 type containerDetails struct {
@@ -52,6 +55,12 @@ type containerDetails struct {
 	State     string
 	Health    string
 	StartedAt string
+}
+
+type notificationDetails struct {
+	Type          string
+	Current       containerDetails
+	PreviousState string
 }
 
 type dockerClient struct {
@@ -95,13 +104,15 @@ func main() {
 		http:     &http.Client{Timeout: cfg.httpTimeout},
 		cfg:      cfg,
 		notified: make(map[string]containerDetails),
+		lastSeen: make(map[string]containerDetails),
 	}
 
-	log.Printf("starting unhealthy monitor: poll_interval=%s request_method=%s request_timeout=%s docker_host=%s headers=%s",
+	log.Printf("starting unhealthy monitor: poll_interval=%s request_method=%s request_timeout=%s docker_host=%s notify_on_running_state_change=%t headers=%s",
 		cfg.pollInterval,
 		cfg.requestMethod,
 		cfg.httpTimeout,
 		dockerClient.displayHost,
+		cfg.notifyOnRunningStateChange,
 		strings.Join(sortedHeaderKeys(cfg.headers), ","),
 	)
 
@@ -172,6 +183,14 @@ func loadConfig() (config, error) {
 		cfg.httpTimeout = parsed
 	}
 
+	if runningStateChange := strings.TrimSpace(os.Getenv("NOTIFY_ON_RUNNING_STATE_CHANGE")); runningStateChange != "" {
+		parsed, err := strconv.ParseBool(runningStateChange)
+		if err != nil {
+			return config{}, fmt.Errorf("parse NOTIFY_ON_RUNNING_STATE_CHANGE: %w", err)
+		}
+		cfg.notifyOnRunningStateChange = parsed
+	}
+
 	return cfg, nil
 }
 
@@ -207,20 +226,43 @@ func (m *monitor) run(ctx context.Context) error {
 }
 
 func (m *monitor) check(ctx context.Context) error {
-	containers, err := m.docker.listUnhealthyContainers(ctx)
+	containers, err := m.docker.listContainers(ctx)
 	if err != nil {
 		return err
 	}
 
+	currentSeen := make(map[string]containerDetails, len(containers))
 	unhealthyIDs := make(map[string]struct{}, len(containers))
 	newlyNotified := 0
 	alreadyTracked := 0
 	recovered := 0
+	runningStateChanges := 0
 	for _, summary := range containers {
 		details, err := m.docker.inspectContainer(ctx, summary.ID)
 		if err != nil {
 			return err
 		}
+
+		currentSeen[summary.ID] = details
+
+		if isRunningStateChange(m.lastSeen[summary.ID], details) && m.cfg.notifyOnRunningStateChange {
+			if err := m.notify(ctx, notificationDetails{
+				Type:          "running_state_change",
+				Current:       details,
+				PreviousState: m.lastSeen[summary.ID].State,
+			}); err != nil {
+				return err
+			}
+
+			runningStateChanges++
+			log.Printf("running state change notification delivered for container %s (%s): %s -> %s",
+				details.Name,
+				details.ID,
+				m.lastSeen[summary.ID].State,
+				details.State,
+			)
+		}
+
 		if !isUnhealthyContainer(details) {
 			continue
 		}
@@ -232,7 +274,7 @@ func (m *monitor) check(ctx context.Context) error {
 			continue
 		}
 
-		if err := m.notify(ctx, details); err != nil {
+		if err := m.notify(ctx, notificationDetails{Type: "unhealthy", Current: details}); err != nil {
 			return err
 		}
 
@@ -249,11 +291,23 @@ func (m *monitor) check(ctx context.Context) error {
 		}
 	}
 
-	log.Printf("health check complete: unhealthy=%d newly_notified=%d already_tracked=%d recovered=%d active_notifications=%d",
+	for id := range m.lastSeen {
+		if _, ok := currentSeen[id]; !ok {
+			delete(m.lastSeen, id)
+		}
+	}
+
+	for id, details := range currentSeen {
+		m.lastSeen[id] = details
+	}
+
+	log.Printf("health check complete: containers=%d unhealthy=%d newly_notified=%d already_tracked=%d recovered=%d running_state_changes=%d active_notifications=%d",
+		len(currentSeen),
 		len(unhealthyIDs),
 		newlyNotified,
 		alreadyTracked,
 		recovered,
+		runningStateChanges,
 		len(m.notified),
 	)
 
@@ -308,17 +362,26 @@ func isUnhealthyContainer(details containerDetails) bool {
 	return strings.EqualFold(details.Health, "unhealthy")
 }
 
-func (m *monitor) notify(ctx context.Context, details containerDetails) error {
+func isRunningStateChange(previous, current containerDetails) bool {
+	return strings.EqualFold(previous.State, "running") && !strings.EqualFold(current.State, "running")
+}
+
+func (m *monitor) notify(ctx context.Context, notification notificationDetails) error {
 	now := time.Now().UTC()
 	data := map[string]any{
 		"container": map[string]any{
-			"id":         details.ID,
-			"name":       details.Name,
-			"image":      details.Image,
-			"status":     details.Status,
-			"state":      details.State,
-			"health":     details.Health,
-			"started_at": details.StartedAt,
+			"id":         notification.Current.ID,
+			"name":       notification.Current.Name,
+			"image":      notification.Current.Image,
+			"status":     notification.Current.Status,
+			"state":      notification.Current.State,
+			"health":     notification.Current.Health,
+			"started_at": notification.Current.StartedAt,
+		},
+		"event": map[string]any{
+			"type":           notification.Type,
+			"previous_state": notification.PreviousState,
+			"current_state":  notification.Current.State,
 		},
 		"time": map[string]any{
 			"rfc3339": now.Format(time.RFC3339),
@@ -338,8 +401,8 @@ func (m *monitor) notify(ctx context.Context, details containerDetails) error {
 
 	log.Printf("sending %s notification for container %s (%s) to %s",
 		m.cfg.requestMethod,
-		details.Name,
-		details.ID,
+		notification.Current.Name,
+		notification.Current.ID,
 		sanitizeURLForLog(requestURL),
 	)
 
@@ -400,19 +463,9 @@ func renderTemplate(tmpl *template.Template, data map[string]any) (string, error
 	return b.String(), nil
 }
 
-func (d *dockerClient) listUnhealthyContainers(ctx context.Context) ([]dockerContainerSummary, error) {
-	filterPayload, err := json.Marshal(map[string]map[string]bool{
-		"health": {
-			"unhealthy": true,
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("encode filters: %w", err)
-	}
-
+func (d *dockerClient) listContainers(ctx context.Context) ([]dockerContainerSummary, error) {
 	query := url.Values{
-		"all":     []string{"1"},
-		"filters": []string{string(filterPayload)},
+		"all": []string{"1"},
 	}
 
 	var containers []dockerContainerSummary
